@@ -1,14 +1,13 @@
-from Py2C import Py2C
+import os
+import glob
+import numpy as np
 import tensorflow as tf
-pyc_lib = Py2C(model_path="model-nodropout.h5",
-               torch=False,
-               input_size=(9,128),
-               type="fxp",
-               fxp_para=(32, 16),
-               num_of_output=1,
-               choose_only_output=True,
-               ide="vs")
-pyc_lib.convert2C()
-pyc_lib.WriteCfile()
-pyc_lib.Write_Float_Weights_File()
-
+from datetime import datetime
+X_test = np.load("x_test.npy")          
+Y_test = np.load("y_test.npy")         
+Y_test = Y_test[:, 0]                  
+Y_test = Y_test - 1                    
+X_test = (X_test - np.mean(X_test)) / (np.std(X_test) + 1e-8)
+Y_test = tf.keras.utils.to_categorical(Y_test, 6)
+print(X_test[0])
+print(Y_test[0])
