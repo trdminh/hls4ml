@@ -321,6 +321,56 @@ class Utils:
 
         print(f"Saved header: {os.path.join(self.path, 'model.h')}")
 
+    def write_test_data_h(self, max_samples=100):
+        ensure_dir(self.path)
+
+        num_samples = min(max_samples, len(self.x_test))
+        x_test_int = quantize_to_int(
+            self.x_test[:num_samples],
+            self.input_scale,
+            dtype=np.int16,
+        )
+        y_test_int = np.argmax(self.y_test[:num_samples], axis=1).astype(np.int8)
+
+        out_min = int(x_test_int.min())
+        out_max = int(x_test_int.max())
+        if out_min < -32768 or out_max > 32767:
+            print("WARNING: test input does not fit int16")
+
+        test_path = os.path.join(self.path, "test_data.h")
+        with open(test_path, "w") as file:
+            file.write("#ifndef TEST_DATA_H\n")
+            file.write("#define TEST_DATA_H\n\n")
+            file.write("#include <stdint.h>\n\n")
+
+            file.write(f"#define NUM_TEST_SAMPLES {x_test_int.shape[0]}\n")
+            file.write(f"#define TEST_INPUT_DIM {x_test_int.shape[1]}\n\n")
+
+            file.write(
+                "static const int16_t x_test_data"
+                f"[NUM_TEST_SAMPLES][TEST_INPUT_DIM] = {{"
+            )
+            for i, row in enumerate(x_test_int):
+                file.write("\n    {")
+                for j, val in enumerate(row):
+                    if j % 15 == 0:
+                        file.write("\n        ")
+                    file.write(f"{int(val)}, ")
+                file.write("\n    },")
+            file.write("\n};\n\n")
+
+            file.write("static const int8_t y_test_label[NUM_TEST_SAMPLES] = {")
+            for i, val in enumerate(y_test_int):
+                if i % 20 == 0:
+                    file.write("\n    ")
+                file.write(f"{int(val)}, ")
+            file.write("\n};\n\n")
+
+            file.write("#endif\n")
+
+        print(f"Saved test data header: {test_path}")
+        print(f"Test samples exported: {num_samples}")
+
     def pynq_dpu(self):
         """
         Keep this only for Vitis AI quantization.
@@ -373,7 +423,7 @@ class Utils:
 if __name__ == "__main__":
     utils_obj = Utils("cpp/")
 
-    model = utils_obj.train_or_load_float_model(train=True)
+    model = utils_obj.train_or_load_float_model(train=False)
 
     utils_obj.check_float_manual_inference()
 
@@ -384,6 +434,7 @@ if __name__ == "__main__":
     utils_obj.evaluate_int()
 
     utils_obj.write_model_h()
+    utils_obj.write_test_data_h(max_samples=100)
 
     # Optional Vitis AI flow:
     # utils_obj.pynq_dpu()
