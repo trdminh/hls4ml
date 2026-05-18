@@ -1,363 +1,389 @@
 import os
-import glob
 import numpy as np
 import tensorflow as tf
-from datetime import datetime
-from sklearn.model_selection import train_test_split
 
-def dump_weights_to_txt_and_bin(model, save_dir="dump_results/dump_results_weights"):
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
+def ensure_dir(path: str):
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+
+def quantize_to_int(x, scale, dtype=np.int32):
+    return np.round(x * scale).astype(dtype)
+
+
+def requantize_round(x_int, divisor):
+    return np.round(x_int / divisor).astype(np.int32)
+
+
+def relu_int(x):
+    return np.maximum(x, 0).astype(np.int32)
+
+
+def dump_float_weights_to_txt_and_bin(
+    model,
+    save_dir="dump_results/dump_results_weights",
+    input_scale=128,
+    weight_scale=128,
+):
+    ensure_dir(save_dir)
 
     dense_idx = 0
     for layer in model.layers:
-        params = layer.get_weights()
-        
-        if len(params) >= 2 and 'dense' in layer.name:
-            weights = params[0]
-            biases = params[1]
-            try:
-                w_pos = params[5] if len(params) >= 6 else 7.0
-                print(f"Layer {layer.name}: Using Weight Pos = {w_pos}")
-            except:
-                w_pos = 7.0
+        if not isinstance(layer, tf.keras.layers.Dense):
+            print(f"Skipping layer {layer.name}")
+            continue
 
-            # QUAN TRỌNG: Nhân với 2^pos để chuyển sang số nguyên
-            scale_factor = 2**w_pos
-            weights_int = np.round(weights * scale_factor).astype(np.int32)
-            biases_int = np.round(biases * scale_factor).astype(np.int32)
+        weights, biases = layer.get_weights()
 
-            base_name = f"quant_dense_{dense_idx}"
-            
-            # Lưu file .txt (Bây giờ sẽ có số nguyên: 15, -60, 110...)
-            np.savetxt(os.path.join(save_dir, f"{base_name}_kernel.txt"), weights_int.flatten(), fmt='%d')
-            np.savetxt(os.path.join(save_dir, f"{base_name}_bias.txt"), biases_int.flatten(), fmt='%d')
-            
-            # Lưu file .bin cho FPGA
-            weights_int.astype(np.int8).tofile(os.path.join(save_dir, f"{base_name}_kernel.bin"))
-            
-            print(f"Saved {base_name} with actual integer values.")
-            dense_idx += 1
-        else:
-            print(f"Skipping layer {layer.name} (No weights to dump)")
-class utils():
-    def __init__(self, path):
+        weights_int = quantize_to_int(weights, weight_scale, dtype=np.int32)
+        biases_int = quantize_to_int(biases, input_scale * weight_scale, dtype=np.int32)
+
+        base_name = f"quant_dense_{dense_idx}"
+
+        np.savetxt(
+            os.path.join(save_dir, f"{base_name}_kernel.txt"),
+            weights_int.flatten(),
+            fmt="%d",
+        )
+        np.savetxt(
+            os.path.join(save_dir, f"{base_name}_bias.txt"),
+            biases_int.flatten(),
+            fmt="%d",
+        )
+
+        weights_int.astype(np.int16).tofile(
+            os.path.join(save_dir, f"{base_name}_kernel.bin")
+        )
+        biases_int.astype(np.int32).tofile(
+            os.path.join(save_dir, f"{base_name}_bias.bin")
+        )
+
+        print(
+            f"Saved {base_name}: "
+            f"w range [{weights_int.min()}, {weights_int.max()}], "
+            f"b range [{biases_int.min()}, {biases_int.max()}]"
+        )
+        dense_idx += 1
+
+
+class Utils:
+    def __init__(self, path="cpp/"):
         self.path = path
-        X = np.load("X.npy")          
-        Y = np.load("Y.npy")         
 
-        Y = Y[:, 0]                  
-        Y = Y - 1                    
-        X = X // 255
         self.num_classes = 6
-        Y = tf.keras.utils.to_categorical(Y, self.num_classes)
-        
-        X_test = np.load("x_test.npy")          
-        Y_test = np.load("y_test.npy")         
-        Y_test = Y_test[:, 0]                  
-        Y_test = Y_test - 1                    
-        X_test = X_test // 255
-        Y_test = tf.keras.utils.to_categorical(Y_test, self.num_classes)
-        self.x_train = X
-        self.y_train = Y
-        self.x_test = X_test
-        self.y_test = Y_test
         self.input_dim = 276
-        self.kernel_size = 3
-        self.dims = [128,256,6]
-    def NN(self, train=False):
-        if train:
-            inputs = tf.keras.Input(shape=(self.input_dim,))
-            x = tf.keras.layers.Dense(128, activation="relu")(inputs)
-            x = tf.keras.layers.Dense(256, activation="relu")(x)
-            outputs = tf.keras.layers.Dense(self.num_classes, activation="softmax")(x)
+        self.dims = [276, 128, 64, 32, 6]
 
-            model = tf.keras.Model(inputs, outputs)
-            model.compile(loss="categorical_crossentropy", optimizer="adam", metrics=["accuracy"])
+        self.input_scale = 128
+        self.weight_scale = 128
+        self.activation_scale = 128
 
-            model.fit(self.x_train, self.y_train, epochs=20, batch_size=32, validation_split=0.1)
+        self.log_scales = [7, 7, 7, 7]
 
+        self.load_data()
+    def load_data(self):
+        X = np.load("X.npy")
+        Y = np.load("Y.npy")
+
+        X_test = np.load("x_test.npy")
+        Y_test = np.load("y_test.npy")
+
+        Y = Y[:, 0] - 1
+        Y_test = Y_test[:, 0] - 1
+        self.x_mean = np.mean(X)
+        self.x_std = np.std(X) + 1e-8
+
+        X = (X - self.x_mean) / self.x_std
+        X_test = (X_test - self.x_mean) / self.x_std
+
+        Y = tf.keras.utils.to_categorical(Y, self.num_classes)
+        Y_test = tf.keras.utils.to_categorical(Y_test, self.num_classes)
+
+        self.x_train = X.astype(np.float32)
+        self.y_train = Y.astype(np.float32)
+        self.x_test = X_test.astype(np.float32)
+        self.y_test = Y_test.astype(np.float32)
+
+
+    def build_model(self):
+        inputs = tf.keras.Input(shape=(self.input_dim,))
+        x = tf.keras.layers.Dense(128, activation="relu", name="dense_0")(inputs)
+        x = tf.keras.layers.Dense(64, activation="relu", name="dense_1")(x)
+        x = tf.keras.layers.Dense(32, activation="relu", name="dense_2")(x)
+        outputs = tf.keras.layers.Dense(self.num_classes, activation="softmax", name="dense_3")(x)
+
+        model = tf.keras.Model(inputs, outputs)
+        model.compile(
+            loss="categorical_crossentropy",
+            optimizer="adam",
+            metrics=["accuracy"],
+        )
+        return model
+
+    def train_or_load_float_model(self, train=False, model_path="model.h5"):
+        if train or not os.path.exists(model_path):
+            model = self.build_model()
+            model.fit(
+                self.x_train,
+                self.y_train,
+                epochs=20,
+                batch_size=32,
+                validation_split=0.1,
+                verbose=1,
+            )
             score = model.evaluate(self.x_test, self.y_test, verbose=0)
             print("Float accuracy:", score[1])
-    
-            model.save("model.h5")
+            model.save(model_path)
         else:
-            model = tf.keras.models.load_model("model.h5")
+            model = tf.keras.models.load_model(model_path)
+            score = model.evaluate(self.x_test, self.y_test, verbose=0)
+            print("Loaded float accuracy:", score[1])
 
+        self.float_model = model
+        return model
+
+    def check_float_manual_inference(self):
+        model = self.float_model
         weights = model.get_weights()
-        self.weights = weights[::2]
-        self.bias = weights[1::2]
-
-        self.layer_data = []
-        data = self.x_test[0].flatten()
-        for i in range(3):
-            print(np.shape(data), np.shape(weights[2*i]), np.shape(weights[2*i+1]))
-            data = data@weights[2*i] + weights[2*i+1]
-            if i != 2:
-                data[data<0] = 0
-            else:
-                pass
-            self.layer_data.append(data)
-        self.res_mnist = data
-        return self.weights, self.bias, self.layer_data
-    
-    def FullyVitisAI(self):
-        bias = []
-        weight = []
-        self.out = []
-        test = []
-
-        scales = [256, 128, 128, 128] 
-        self.log_scales = [8, 7, 7, 7]
-        layers = [276, 128, 64, 32, 6] 
-
-        dense_indices = [0, 2, 4, 6] 
-
-        for i, idx in enumerate(dense_indices):
-            w_path = f"dump_results/dump_results_weights/quant_dense_{idx}_kernel.txt"
-            b_path = f"dump_results/dump_results_weights/quant_dense_{idx}_bias.txt"
-            
-            w_data = np.loadtxt(w_path)
-            b_data = np.loadtxt(b_path)
-            weight.append(w_data.reshape(layers[i], layers[i+1]))
-            bias.append(b_data)
-
-        self.weights_int = weight
-        self.bias_int = bias
 
         err = 0
-
         for i in range(len(self.x_test)):
-            data = self.x_test[i].astype(np.int16)
-            for j in range(4): 
-                z = data @ weight[j] + bias[j]
-                test.append(z)
-                data = z // scales[j]
-                if j != 3: 
-                    data = data * (data > 0)
-                self.out.append(data)
-            res = np.argmax(data)
-            if res != np.argmax(self.y_test[i]):
+            data = self.x_test[i]
+
+            for layer_idx in range(4):
+                w = weights[2 * layer_idx]
+                b = weights[2 * layer_idx + 1]
+                data = data @ w + b
+                if layer_idx < 3:
+                    data = np.maximum(data, 0)
+
+            pred = np.argmax(data)
+            label = np.argmax(self.y_test[i])
+            if pred != label:
                 err += 1
-        print(err)
-        print("acc {}".format(1-err/len(self.x_test)))
-        
-        # Check if still in range of int16 (-32,768 to +32,767)
 
-        mins= []
-        maxs = []
-        for i in range(len(self.x_test)):
-            mins.append(np.min(self.out[i]))
-            maxs.append(np.max(self.out[i]))
+        acc = 1 - err / len(self.x_test)
+        print("Manual float logits accuracy:", acc)
+        return acc
 
-        print(np.min(mins), np.max(maxs))
-        
-        mins= []
-        maxs = []
-        for i in range(len(self.x_test)):
-            mins.append(np.min(test[i]))
-            maxs.append(np.max(test[i]))
-
-        print(np.min(mins), np.max(maxs))
-
-        return self.out, bias, weight, test
-    
-    def write_model_h(self):
-        self.weights_int[2] = np.pad(self.weights_int[2], ((0,0),(0,32)))
-        self.weights_int[3] = np.pad(self.weights_int[3], ((0,0),(0,58)))
-
-        x = self.x_test.astype(np.int16)
-
-        w1 = self.weights_int[0].astype(np.int16).flatten()
-        w2 = self.weights_int[1].astype(np.int16).flatten()
-        w3 = self.weights_int[2].astype(np.int16).flatten()
-        w4 = self.weights_int[3].astype(np.int16).flatten()
-
-        b1 = self.bias_int[0].astype(np.int16)
-        b2 = self.bias_int[1].astype(np.int16)
-        b3 = self.bias_int[2].astype(np.int16)
-        b4 = self.bias_int[3].astype(np.int16)
-
-        w = np.concatenate([w1, w2, w3, w4])
-        b = np.concatenate([b1, b2, b3, b4])
-        res = np.concatenate([
-            self.out[0].flatten(),
-            self.out[1].flatten(),
-            self.out[2].flatten(),
-            self.out[3].flatten()
-        ]).astype(np.int16)
-        
-        n_weights1 = np.shape(w1)[0]
-        n_weights2 = np.shape(w2)[0]
-        n_weights3 = np.shape(w3)[0]
-        n_weights4 = np.shape(w4)[0]
-        n_weights = np.shape(w)[0]
-        n_bias = np.shape(b)[0]
-        
-        with open(self.path+'/model.h','w') as file:
-            file.writelines('/* HW AI HLS, autogenerated File, Tran Doan Minh, {} */ \n \n'.format(datetime.now().strftime("%d/%m/%Y, %H:%M:%S")))
-            
-            file.writelines('#include <stdint.h> \n')
-            file.writelines('\n')
-            
-            file.writelines('static const int16_t weights1[{}] = \n'.format(n_weights1))
-            file.writelines(' {')
-            
-            for j in range(n_weights1):
-                if j == n_weights1 - 1:
-                    file.writelines('{}'.format(w1[j]))
-                else:
-                    if j % self.input_dim == 0:
-                        file.writelines('\n        {},'.format(w1[j]))
-                    else:
-                        file.writelines('{},'.format(w1[j]))
-            
-            file.writelines('  };\n')
-            file.writelines('\n')
-            
-            file.writelines('static const int16_t weights2[{}] = \n'.format(n_weights2))
-            file.writelines(' {')
-            
-            for j in range(n_weights2):
-                if j == n_weights2 - 1:
-                    file.writelines('{}'.format(w2[j]))
-                else:
-                    if j % self.input_dim == 0:
-                        file.writelines('\n        {},'.format(w2[j]))
-                    else:
-                        file.writelines('{},'.format(w2[j]))
-            file.writelines('  };\n')
-            file.writelines('\n')
-            
-            file.writelines('static const int16_t weights3[{}] = \n'.format(n_weights3))
-            file.writelines(' {')
-            
-            for j in range(n_weights3):
-                if j == n_weights3 - 1:
-                    file.writelines('{}'.format(w3[j]))
-                else:
-                    if j % self.input_dim == 0:
-                        file.writelines('\n        {},'.format(w3[j]))
-                    else:
-                        file.writelines('{},'.format(w3[j]))
-            file.writelines('  };\n')
-            file.writelines('\n')
-            
-            file.writelines('static const int16_t weights4[{}] = \n'.format(n_weights4))
-            file.writelines(' {')
-            
-            for j in range(n_weights4):
-                if j == n_weights4 - 1:
-                    file.writelines('{}'.format(w4[j]))
-                else:
-                    if j % self.input_dim == 0:
-                        file.writelines('\n        {},'.format(w4[j]))
-                    else:
-                        file.writelines('{},'.format(w4[j]))
-            file.writelines('  };\n')
-            file.writelines('\n')
-            
-            file.writelines('static const int16_t bias[{}] = \n'.format(n_bias))
-            file.writelines('  {')
-             
-            for j in range(n_bias):
-                if j == n_bias -1:
-                    file.writelines('{}'.format(b[j]))
-                else:
-                    if j % self.input_dim == 0:
-                        file.writelines('\n        {},'.format(b[j]))
-                    else:
-                        file.writelines('{},'.format(b[j]))     
-            file.writelines('  };\n')
-            file.writelines('\n')
-            n_input = self.input_dim   
-
-            file.writelines('static const int16_t im[{}] = \n'.format(n_input))
-            file.writelines('  {')
-            print(x[0])
-            print(self.y_test[0])
-            for j in range(n_input):
-                val = int(x[0][j])   
-
-                if j == n_input - 1:
-                    file.writelines('{}'.format(val))
-                else:
-                    if j % 16 == 0:   
-                        file.writelines('\n        {},'.format(val))
-                    else:
-                        file.writelines('{},'.format(val))
-
-            file.writelines('  };\n')
-            file.writelines('\n')
-            n_res = len(res)
-
-            file.writelines('static const int16_t res_layers[{}] = \n'.format(n_res))
-            file.writelines('  {')
-
-            for j in range(n_res):
-                if j == n_res - 1:
-                    file.writelines('{}'.format(int(res[j])))
-                else:
-                    if j % self.input_dim == 0:
-                        file.writelines('\n        {},'.format(int(res[j])))
-                    else:
-                        file.writelines('{},'.format(int(res[j])))
-
-            file.writelines('  };\n')
-            file.writelines('\n')
-            file.writelines('static const int16_t scales[{}] = \n'.format(len(self.log_scales)))
-            file.writelines('  {')
-             
-            for j in range(4):
-                if j == np.sum(np.shape(self.dims)[0]) -1:
-                    file.writelines('{}'.format((self.log_scales[j])))
-                else:
-                    if j % self.input_dim == 0:
-                        file.writelines('\n        {},'.format(self.log_scales[j]))
-                    else:
-                        file.writelines('{},'.format(self.log_scales[j]))
-            file.writelines('};\n')
-            file.writelines('\n')
-    def pynq_dpu(self):
-        from tensorflow_model_optimization.quantization.keras import vitis_quantize
-        model = tf.keras.models.load_model("model.h5")
-        quantizer = vitis_quantize.VitisQuantizer(model)
-        quantized_model = quantizer.quantize_model(calib_dataset = self.x_test[1:1024], weight_bit=16, activation_bit=16)
-        
-        quantized_model.compile(loss='categorical_crossentropy', metrics=["accuracy"])
-        score = quantized_model.evaluate(self.x_test, self.y_test,  verbose=0, batch_size=32)
-        print("Quantized acc: ",score)
-        quantized_model.save('model_quant.h5')
-        
-        os.system("vai_c_tensorflow2 \
-            --model ./model_quant.h5 \
-            --arch /opt/vitis_ai/compiler/arch/DPUCZDX8G/KV260/arch.json \
-            --output_dir comp/ \
-            --net_name model")
-        
-        quantizer.dump_model(
-            quantized_model, 
-            dataset=self.x_test[1:1024], 
-            output_dir='./dump_results', 
-            dump_float=True,
-
+    def dump_quant_params_from_float(self):
+        dump_float_weights_to_txt_and_bin(
+            self.float_model,
+            save_dir="dump_results/dump_results_weights",
+            input_scale=self.input_scale,
+            weight_scale=self.weight_scale,
         )
+
+    def load_quant_params(self, weight_dir="dump_results/dump_results_weights"):
+        weights_int = []
+        biases_int = []
+
+        for i in range(4):
+            w_path = os.path.join(weight_dir, f"quant_dense_{i}_kernel.txt")
+            b_path = os.path.join(weight_dir, f"quant_dense_{i}_bias.txt")
+
+            if not os.path.exists(w_path):
+                raise FileNotFoundError(f"Missing weight file: {w_path}")
+            if not os.path.exists(b_path):
+                raise FileNotFoundError(f"Missing bias file: {b_path}")
+
+            w_data = np.loadtxt(w_path, dtype=np.int32)
+            b_data = np.loadtxt(b_path, dtype=np.int32)
+
+            w_data = w_data.reshape(self.dims[i], self.dims[i + 1])
+            b_data = b_data.reshape(self.dims[i + 1])
+
+            weights_int.append(w_data)
+            biases_int.append(b_data)
+
+            print(
+                f"Loaded layer {i}: "
+                f"W {w_data.shape}, B {b_data.shape}, "
+                f"W range [{w_data.min()}, {w_data.max()}], "
+                f"B range [{b_data.min()}, {b_data.max()}]"
+            )
+
+        self.weights_int = weights_int
+        self.bias_int = biases_int
+        return weights_int, biases_int
+
+    def infer_one_int(self, x_float):
+        data = quantize_to_int(x_float, self.input_scale, dtype=np.int32)
+        layer_outputs = []
+        layer_accs = []
+
+        for layer_idx in range(4):
+            acc = data @ self.weights_int[layer_idx] + self.bias_int[layer_idx]
+            layer_accs.append(acc.copy())
+
+            data = requantize_round(acc, self.weight_scale)
+
+            # ReLU for hidden layers only.
+            if layer_idx < 3:
+                data = relu_int(data)
+
+            layer_outputs.append(data.copy())
+
+        return data, layer_outputs, layer_accs
+
+    def evaluate_int(self):
+        err = 0
+        all_outputs = []
+        all_accs = []
+
+        for i in range(len(self.x_test)):
+            logits_int, layer_outputs, layer_accs = self.infer_one_int(self.x_test[i])
+
+            all_outputs.extend(layer_outputs)
+            all_accs.extend(layer_accs)
+
+            pred = np.argmax(logits_int)
+            label = np.argmax(self.y_test[i])
+            if pred != label:
+                err += 1
+
+        acc = 1 - err / len(self.x_test)
+        print("Integer fixed-point accuracy:", acc)
+        print("Errors:", err, "/", len(self.x_test))
+
+        self.out = all_outputs
+        self.accs = all_accs
+
+        out_min = min(np.min(o) for o in all_outputs)
+        out_max = max(np.max(o) for o in all_outputs)
+        acc_min = min(np.min(a) for a in all_accs)
+        acc_max = max(np.max(a) for a in all_accs)
+
+        print("Layer output range:", out_min, out_max)
+        print("Accumulator range:", acc_min, acc_max)
+
+        if out_min < -32768 or out_max > 32767:
+            print("WARNING: layer output does not fit int16")
+        if acc_min < -2147483648 or acc_max > 2147483647:
+            print("WARNING: accumulator does not fit int32")
+
+        return acc
+
+    def write_model_h(self):
+        ensure_dir(self.path)
+
+        x_sample = quantize_to_int(
+            self.x_test[0],
+            self.input_scale,
+            dtype=np.int16,
+        ).flatten()
+
+        w_layers = [w.astype(np.int16).flatten() for w in self.weights_int]
+
+        b_all = np.concatenate([b.flatten() for b in self.bias_int]).astype(np.int32)
+
+        with open(os.path.join(self.path, "model.h"), "w") as file:
+            file.write("#ifndef MODEL_H\n")
+            file.write("#define MODEL_H\n\n")
+            file.write("#include <stdint.h>\n\n")
+
+            file.write(f"#define INPUT_SCALE {self.input_scale}\n")
+            file.write(f"#define WEIGHT_SCALE {self.weight_scale}\n")
+            file.write(f"#define ACTIVATION_SCALE {self.activation_scale}\n\n")
+
+            for i, w in enumerate(w_layers, 1):
+                file.write(f"static const int16_t weights{i}[{len(w)}] = {{")
+                for j, val in enumerate(w):
+                    if j % 15 == 0:
+                        file.write("\n    ")
+                    file.write(f"{int(val)}, ")
+                file.write("\n};\n\n")
+
+            file.write(f"static const int32_t bias[{len(b_all)}] = {{")
+            for j, val in enumerate(b_all):
+                if j % 10 == 0:
+                    file.write("\n    ")
+                file.write(f"{int(val)}, ")
+            file.write("\n};\n\n")
+
+            file.write(f"static const int16_t im[{len(x_sample)}] = {{")
+            for j, val in enumerate(x_sample):
+                if j % 15 == 0:
+                    file.write("\n    ")
+                file.write(f"{int(val)}, ")
+            file.write("\n};\n\n")
+
+            file.write(
+                f"static const int16_t dims[{len(self.dims)}] = "
+                f"{{ {', '.join(map(str, self.dims))} }};\n"
+            )
+            file.write(
+                f"static const int8_t scales[{len(self.log_scales)}] = "
+                f"{{ {', '.join(map(str, self.log_scales))} }};\n"
+            )
+
+            file.write("\n#endif\n")
+
+        print(f"Saved header: {os.path.join(self.path, 'model.h')}")
+
+    def pynq_dpu(self):
+        """
+        Keep this only for Vitis AI quantization.
+        Note: The manual fixed-point inference above does not use Vitis internal scales.
+        If you use VitisQuantizer, prefer evaluating quantized_model directly.
+        """
+        from tensorflow_model_optimization.quantization.keras import vitis_quantize
+
+        model = self.train_or_load_float_model(train=True)
+
+        print(model.predict(self.x_test[0][np.newaxis, ...]))
+
+        quantizer = vitis_quantize.VitisQuantizer(model)
+        quantized_model = quantizer.quantize_model(
+            calib_dataset=self.x_test[1:1024],
+            weight_bit=16,
+            activation_bit=16,
+        )
+
+        quantized_model.compile(
+            loss="categorical_crossentropy",
+            metrics=["accuracy"],
+        )
+
+        score = quantized_model.evaluate(
+            self.x_test,
+            self.y_test,
+            verbose=0,
+            batch_size=32,
+        )
+        print("Vitis quantized score:", score)
+
+        quantized_model.save("model_quant.h5")
+
         quantizer.dump_model(
-            quantized_model, 
-            dataset=self.x_test[1:1024], 
-            output_dir='./dump_results', 
+            quantized_model,
+            dataset=self.x_test[1:1024],
+            output_dir="./dump_results",
+            dump_float=True,
+        )
+
+        quantizer.dump_model(
+            quantized_model,
+            dataset=self.x_test[1:1024],
+            output_dir="./dump_results",
             dump_float=False,
         )
-        
-        dump_weights_to_txt_and_bin(quantized_model)
-if __name__ == '__main__':
 
-    utils_obj = utils('cpp/')
 
-    w, b, data = utils_obj.NN(True)
+if __name__ == "__main__":
+    utils_obj = Utils("cpp/")
 
-    # utils_obj.rename()
-    #out, b, w, test = utils_obj.FullyVitisAI()
-    #utils_obj.write_model_h()
-    #utils_obj.pynq_dpu()
+    model = utils_obj.train_or_load_float_model(train=True)
 
+    utils_obj.check_float_manual_inference()
+
+    utils_obj.dump_quant_params_from_float()
+
+    utils_obj.load_quant_params()
+
+    utils_obj.evaluate_int()
+
+    utils_obj.write_model_h()
+
+    # Optional Vitis AI flow:
+    # utils_obj.pynq_dpu()

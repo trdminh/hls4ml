@@ -16,6 +16,7 @@ int main() {
 
 	MultilayerPerceptron(im, out);
 
+	printf("Predicted class: %d\n", out[0]);
 
   return 0;
 }
