@@ -1,0 +1,7 @@
+/env
+*.h5
+/data
+*.npy
+*.csv
+**/__pycache__/
+__pycache__/
