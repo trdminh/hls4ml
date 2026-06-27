@@ -1,8 +1,6 @@
 # HLS4ML
 
 A Python library for converting Deep Learning models into synthesizable C/C++ High-Level Synthesis (HLS) code for FPGA deployment.
-
-
 ---
 
 ## 1. Project Structure
