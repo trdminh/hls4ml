@@ -1,7 +1,17 @@
 #include "MLP.h"
 #include <stdio.h>
 
-static int16_t RequantizeRoundEven(int32_t value, int8_t scale) {
+static int8_t SaturateInt8(int32_t value) {
+    if (value > 127) {
+        return 127;
+    }
+    if (value < -128) {
+        return -128;
+    }
+    return (int8_t)value;
+}
+
+static int8_t RequantizeRoundEven(int32_t value, int8_t scale) {
     const int32_t divisor = (int32_t)1 << scale;
     const int32_t half = divisor >> 1;
     const bool negative = value < 0;
@@ -16,13 +26,13 @@ static int16_t RequantizeRoundEven(int32_t value, int8_t scale) {
     }
 
     int32_t rounded = negative ? -(int32_t)quotient : (int32_t)quotient;
-    return (int16_t)rounded;
+    return SaturateInt8(rounded);
 }
 
 void FullyConnectedLayer(
-    const int16_t A[],
-    const int16_t B[],
-    int16_t C[],
+    const int8_t A[],
+    const int8_t B[],
+    int8_t C[],
     const int32_t bias[],
     const int8_t scale,
     int K,
@@ -39,27 +49,27 @@ void FullyConnectedLayer(
             sum += (int32_t)A[k] * (int32_t)B[k * N + j];
         }
 
-        int16_t res = RequantizeRoundEven(sum, scale);
+        int8_t res = RequantizeRoundEven(sum, scale);
 
         if (relu) {
-            C[j] = (res < 0) ? (int16_t)0 : res;
+            C[j] = (res < 0) ? (int8_t)0 : res;
         } else {
             C[j] = res;
         }
     }
 }
 
-void MultilayerPerceptron(const int16_t im[], int16_t out[]) {
+void MultilayerPerceptron(const int8_t im[], int8_t out[]) {
     #pragma HLS INTERFACE m_axi port=im bundle=gmem0 offset=slave depth=276
     #pragma HLS INTERFACE m_axi port=out bundle=gmem1 offset=slave depth=6
     #pragma HLS INTERFACE s_axilite port=im bundle=control
     #pragma HLS INTERFACE s_axilite port=out bundle=control
     #pragma HLS INTERFACE s_axilite port=return bundle=control
 
-    int16_t data1[128];
-    int16_t data2[64];
-    int16_t data3[32];
-    int16_t data4[6];
+    int8_t data1[128];
+    int8_t data2[64];
+    int8_t data3[32];
+    int8_t data4[6];
 
     FullyConnectedLayer(im, weights1, data1,
                         &bias[bias_offset[0]], scales[0], 276, 128, true);
@@ -70,14 +80,14 @@ void MultilayerPerceptron(const int16_t im[], int16_t out[]) {
     FullyConnectedLayer(data3, weights4, data4,
                         &bias[bias_offset[3]], scales[3], 32, 6, false);
 
-    int16_t max_val = -32768;
-    int16_t argmax = 0;
+    int8_t max_val = -128;
+    int8_t argmax = 0;
     for (int j = 0; j < 6; j++) {
         #pragma HLS PIPELINE II=1
         out[j] = data4[j];
         if (data4[j] > max_val) {
             max_val = data4[j];
-            argmax = (int16_t)j;
+            argmax = (int8_t)j;
         }
     }
 

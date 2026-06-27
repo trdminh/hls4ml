@@ -14,12 +14,12 @@ constexpr int bias_offset[] = {
 
 constexpr int n_layers = 4;
 
-void MultilayerPerceptron(const int16_t im[276], int16_t out[6]);
+void MultilayerPerceptron(const int8_t im[276], int8_t out[6]);
 
 void FullyConnectedLayer(
-    const int16_t A[],
-    const int16_t B[],
-    int16_t C[],
+    const int8_t A[],
+    const int8_t B[],
+    int8_t C[],
     const int32_t bias[],
     const int8_t scale,
     int K,

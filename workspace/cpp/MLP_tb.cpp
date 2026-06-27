@@ -6,7 +6,7 @@
 int main() {
     int correct = 0;
     int printed_mismatches = 0;
-    int16_t out[6];
+    int8_t out[6];
 
     for (int i = 0; i < NUM_TEST_SAMPLES; ++i) {
         MultilayerPerceptron(x_test_data[i], out);
